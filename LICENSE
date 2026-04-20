@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 motorsep
+Copyright (c) 2026 Alex
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,11 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+--
+
+Third-party components:
+
+This project bundles ufbx by Samuli Raivio (https://github.com/ufbx/ufbx),
+licensed under the MIT license. The bundled files are src/ufbx.c and
+src/ufbx.h. See the ufbx repository for the complete license text.

@@ -1,39 +1,28 @@
 @echo off
+REM ----------------------------------------------------------------------
+REM  Generate a Visual Studio 2022 solution for fbx2md5 under build\.
+REM  After this script finishes, open build\fbx2md5.sln in VS and build
+REM  the fbx2md5 target (Release x64 recommended).
+REM
+REM  Requires:
+REM    * CMake 3.15 or newer on PATH
+REM    * Visual Studio 2022 with the "Desktop development with C++" workload
+REM ----------------------------------------------------------------------
+
 setlocal
 
-echo === fbx2md5 - Generate Visual Studio 2022 Solution ===
-echo.
+if not exist build mkdir build
 
-:: Clean old build if it exists (avoids stale CMake cache issues)
-if exist "build" (
-    echo Cleaning old build directory...
-    rmdir /s /q build
-)
-
-mkdir build
-cd build
-
-:: Configure - generates .sln and .vcxproj files
-:: FBX SDK is auto-detected from common install locations.
-:: Override with: cmake -DFBX_SDK_ROOT="C:\path\to\sdk" ..
-echo Configuring...
-cmake -G "Visual Studio 17 2022" -A x64 -DFBX_STATIC=ON ..
-if %errorlevel% neq 0 (
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+if errorlevel 1 (
     echo.
-    echo ERROR: CMake configure failed.
-    echo.
-    echo If FBX SDK was not found, install it or pass the path:
-    echo   cmake -G "Visual Studio 17 2022" -A x64 -DFBX_SDK_ROOT="C:\Program Files\Autodesk\FBX\FBX SDK\2020.3.7" ..
-    pause
+    echo [FAILED] CMake generation failed. See messages above.
     exit /b 1
 )
 
 echo.
-echo === Solution generated successfully ===
-echo.
-echo Solution file: %cd%\fbx2md5.sln
-echo.
-echo Opening in Visual Studio...
-start fbx2md5.sln
+echo [OK] Solution generated: build\fbx2md5.sln
+echo      Open it in Visual Studio 2022 and build the fbx2md5 target.
+echo      The executable will appear in build\Release\fbx2md5.exe.
 
-pause
+endlocal
