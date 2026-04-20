@@ -36,7 +36,7 @@
 //   - Multi-byte or Unicode character set both fine.
 //
 // Usage:
-//   fbx2md5 input.fbx output [-scale X.X] [-fps N] [-noaxes] [-v12]
+//   fbx2md5 input.fbx output [-scale X.X] [-fps N] [-noaxes] [-v12] [-noAnimPrefix]
 //
 // Produces:
 //   output.md5mesh
@@ -45,7 +45,7 @@
 // Defaults:
 //   -scale   1.0        (world-unit multiplier applied to all positions)
 //   -fps     <from FBX scene>   (falls back to 24 if the FBX doesn't report one)
-//   axes     convert to Z-up, X-forward, right-handed (idtech4 convention)
+//   axes     convert to Z-up, X-forward, right-handed (idTech4 convention)
 //
 // Correctness notes:
 //   * Weight offsets use ufbx_skin_cluster.geometry_to_bone directly --
@@ -972,6 +972,18 @@ static bool WriteMD5Anim(const char *path,
 // -----------------------------------------------------------------------------
 
 static std::string SanitizeFilenameStem(const char *src, size_t len) {
+	// FBX anim stacks are typically named "<objectname>|<actionname>" (Blender,
+	// Maya, MotionBuilder all follow this convention -- '|' is FBX's namespace
+	// separator). Strip everything up to and including the LAST '|' so the
+	// filename is just the action name.
+	for (size_t i = len; i > 0; --i) {
+		if (src[i - 1] == '|') {
+			src += i;
+			len -= i;
+			break;
+		}
+	}
+
 	std::string out;
 	out.reserve(len + 1);
 	for (size_t i = 0; i < len; ++i) {
@@ -979,7 +991,7 @@ static std::string SanitizeFilenameStem(const char *src, size_t len) {
 		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
 		    (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') {
 			out += c;
-		} else if (c == ' ' || c == '|') {
+		} else if (c == ' ') {
 			out += '_';
 		}
 	}
@@ -995,17 +1007,26 @@ static void PrintUsage() {
 	fprintf(stderr,
 		"fbx2md5 -- FBX to idTech4 MD5 mesh/anim converter\n\n"
 		"Usage:\n"
-		"  fbx2md5 input.fbx output [-scale X.X] [-fps N] [-noaxes] [-nounits] [-v12]\n\n"
+		"  fbx2md5 input.fbx output [-scale X.X] [-fps N] [-noaxes] [-nounits]\n"
+		"                           [-v12] [-noAnimPrefix]\n\n"
 		"Options:\n"
-		"  -scale X.X   Extra multiplier applied to all positions (default 1.0).\n"
-		"  -fps N       Override sample rate (default: FBX scene fps).\n"
-		"  -noaxes      Skip idTech4 axis conversion (keep FBX axes as-is).\n"
-		"  -nounits     Skip FBX unit conversion (keep FBX units as-is).\n"
-		"               Without this flag, scene is normalized so 1 FBX\n"
-		"               world unit = 1 output unit (cm FBXs end up /100).\n"
-		"  -v12         Output MD5 Version 12 mesh (per-vertex normals,\n"
-		"               MikkTSpace tangents, optional vertex colors).\n"
-		"               Anim output remains Version 10.\n\n"
+		"  -scale X.X    Extra multiplier applied to all positions (default 1.0).\n"
+		"  -fps N        Override sample rate (default: FBX scene fps).\n"
+		"  -noaxes       Skip idTech4 axis conversion (keep FBX axes as-is).\n"
+		"  -nounits      Skip FBX unit conversion (keep FBX units as-is).\n"
+		"                Without this flag, scene is normalized so 1 FBX\n"
+		"                world unit = 1 output unit (cm FBXs end up /100).\n"
+		"  -v12          Output MD5 Version 12 mesh (per-vertex normals,\n"
+		"                MikkTSpace tangents, optional vertex colors).\n"
+		"                Anim output remains Version 10.\n"
+		"  -noAnimPrefix Write anims as <stack>.md5anim instead of\n"
+		"                <output>_<stack>.md5anim. The output stem's directory\n"
+		"                (if any) is preserved.\n\n"
+		"Note on anim stack names:\n"
+		"  FBX tools (Blender, Maya, etc.) often prefix stack names with the\n"
+		"  object namespace, e.g. \"imp|slash1\". Everything up to and including\n"
+		"  the last '|' is stripped automatically, so you get 'slash1', not\n"
+		"  'imp_slash1', in the output filename.\n\n"
 		"Outputs:\n"
 		"  output.md5mesh\n"
 		"  output_<stackname>.md5anim (one per FBX animation stack)\n");
@@ -1022,6 +1043,7 @@ int main(int argc, char **argv) {
 	bool   convertAxes = true;
 	bool   convertUnits = true;
 	bool   v12 = false;
+	bool   noAnimPrefix = false;
 
 	for (int i = 3; i < argc; ++i) {
 		if (!strcmp(argv[i], "-scale") && i + 1 < argc) {
@@ -1034,6 +1056,8 @@ int main(int argc, char **argv) {
 			convertUnits = false;
 		} else if (!strcmp(argv[i], "-v12")) {
 			v12 = true;
+		} else if (!strcmp(argv[i], "-noAnimPrefix") || !strcmp(argv[i], "-noanimprefix")) {
+			noAnimPrefix = true;
 		} else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
 			PrintUsage();
 			return 0;
@@ -1142,12 +1166,27 @@ int main(int argc, char **argv) {
 	}
 	printf("  using %.3f fps\n", fps);
 
+	// Precompute the directory part of outputStem (everything up to the last
+	// '/' or '\\', inclusive) so -noAnimPrefix writes anims into the same
+	// directory as the mesh rather than the current working directory.
+	std::string animDir;
+	{
+		const char *s = outputStem;
+		const char *lastSep = nullptr;
+		for (const char *p = s; *p; ++p) {
+			if (*p == '/' || *p == '\\') lastSep = p;
+		}
+		if (lastSep) animDir.assign(s, (size_t)(lastSep - s + 1));
+	}
+
 	int animsWritten = 0;
 	for (size_t si = 0; si < scene->anim_stacks.count; ++si) {
 		ufbx_anim_stack *stack = scene->anim_stacks.data[si];
 
 		std::string stackName = SanitizeFilenameStem(stack->name.data, stack->name.length);
-		std::string animPath  = std::string(outputStem) + "_" + stackName + ".md5anim";
+		std::string animPath  = noAnimPrefix
+			? (animDir + stackName + ".md5anim")
+			: (std::string(outputStem) + "_" + stackName + ".md5anim");
 
 		printf("anim stack '%.*s' -> %s\n",
 		       (int)stack->name.length, stack->name.data, animPath.c_str());
