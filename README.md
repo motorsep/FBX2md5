@@ -1,6 +1,6 @@
 # fbx2md5
 
-A command-line converter from FBX to Doom 3 / idTech 4 MD5 skeletal mesh and
+A command-line converter from FBX to idTech 4 MD5 skeletal mesh and
 animation formats. A single invocation reads one FBX and writes:
 
 - `<output>.md5mesh` — the rest-pose skinned mesh plus its skeleton
