@@ -1,7 +1,7 @@
 /*
- * fbx2md5 -- FBX to Doom 3 / idTech 4 MD5 mesh and animation converter.
+ * fbx2md5 -- FBX to idTech4 MD5 mesh and animation converter.
  *
- * Copyright (c) 2026 Alex
+ * Copyright (c) 2026 motorsep
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -27,7 +27,7 @@
 
 // =============================================================================
 // fbx2md5.cpp
-// FBX to Doom 3 MD5 mesh/anim converter using the ufbx library.
+// FBX to idTech4 MD5 mesh/anim converter using the ufbx library.
 //
 // Build (MSVC 2022, single translation unit + ufbx.c):
 //   - Add fbx2md5.cpp, ufbx.c, ufbx.h to a Console Application project.
@@ -36,7 +36,7 @@
 //   - Multi-byte or Unicode character set both fine.
 //
 // Usage:
-//   fbx2md5 input.fbx output [-scale X.X] [-fps N] [-noaxes]
+//   fbx2md5 input.fbx output [-scale X.X] [-fps N] [-noaxes] [-v12]
 //
 // Produces:
 //   output.md5mesh
@@ -45,7 +45,7 @@
 // Defaults:
 //   -scale   1.0        (world-unit multiplier applied to all positions)
 //   -fps     <from FBX scene>   (falls back to 24 if the FBX doesn't report one)
-//   axes     convert to Z-up, X-forward, right-handed (Doom 3 convention)
+//   axes     convert to Z-up, X-forward, right-handed (idtech4 convention)
 //
 // Correctness notes:
 //   * Weight offsets use ufbx_skin_cluster.geometry_to_bone directly --
@@ -81,6 +81,7 @@
 
 static const char *MD5_VERSION_STRING = "MD5Version";
 static const int   MD5_VERSION        = 10;
+static const int   MD5_VERSION_V12    = 12;  // per-vertex normals + MikkTSpace tangents
 
 enum {
 	ANIM_TX = 1 << 0,
@@ -93,11 +94,12 @@ enum {
 static const char *ANIM_BIT_NAMES[6] = { "Tx", "Ty", "Tz", "Qx", "Qy", "Qz" };
 
 // Thresholds (match the Maya exporter's DEFAULT_ANIM_EPSILON / QUAT_EPSILON)
-static const float XYZ_EPSILON  = 0.1f;        // legacy Doom 3 threshold
+static const float XYZ_EPSILON  = 0.1f;        // legacy idTech4 threshold
 static const float QUAT_EPSILON = 0.000001f;
 static const float VERT_EPSILON = 0.001f;
 static const float UV_EPSILON   = 0.001f;
 static const float MIN_WEIGHT   = 0.001f;
+static const float NORMAL_EPSILON = 0.001f;
 
 // -----------------------------------------------------------------------------
 // Small math helpers
@@ -151,6 +153,27 @@ static ufbx_matrix MatFromTR(ufbx_vec3 t, ufbx_quat q) {
 	return ufbx_transform_to_matrix(&tf);
 }
 
+// Transform a direction vector by the 3x3 rotation part of a matrix (no translation).
+static ufbx_vec3 TransformDir(const ufbx_matrix &m, ufbx_vec3 v) {
+	return {
+		(ufbx_real)(m.cols[0].x*v.x + m.cols[1].x*v.y + m.cols[2].x*v.z),
+		(ufbx_real)(m.cols[0].y*v.x + m.cols[1].y*v.y + m.cols[2].y*v.z),
+		(ufbx_real)(m.cols[0].z*v.x + m.cols[1].z*v.y + m.cols[2].z*v.z)
+	};
+}
+
+static ufbx_vec3 NormalizeVec3(ufbx_vec3 v) {
+	double len = sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
+	if (len > 1e-12) { v.x = (ufbx_real)(v.x/len); v.y = (ufbx_real)(v.y/len); v.z = (ufbx_real)(v.z/len); }
+	return v;
+}
+
+static ufbx_vec3 CrossVec3(ufbx_vec3 a, ufbx_vec3 b) {
+	return { a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x };
+}
+
+static double DotVec3(ufbx_vec3 a, ufbx_vec3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+
 // -----------------------------------------------------------------------------
 // Name sanitization for the MD5 "shader" field.
 // Keep alnum, underscore, dash, slash, dot. Convert whitespace to underscore.
@@ -195,6 +218,11 @@ struct ExportVertex {
 	float      uv[2];
 	int        startWeight;
 	int        numWeights;
+	// v12 per-vertex data (stored in bone-rotated space for the dominant joint)
+	float      normal[3];    // ( Nx Ny Nz )
+	float      tangent[4];   // ( Tx Ty Tz Tw ) -- Tw = bitangent sign
+	float      color[4];     // ( R G B A )  -- vertex color, default (1,1,1,1)
+	bool       hasColor;
 };
 
 struct ExportTri { int v[3]; };
@@ -316,7 +344,10 @@ static void EnsureAtLeastOneJoint(std::vector<ExportJoint> &joints) {
 struct DedupeKey {
 	float u, v;
 	std::vector<ExportWeight> ws;
-	bool Equals(const DedupeKey &o) const {
+	// v12 fields for normal-aware deduplication
+	float normal[3];
+	float tangent[4];
+	bool Equals(const DedupeKey &o, bool v12) const {
 		if (std::fabs(u - o.u) > UV_EPSILON) return false;
 		if (std::fabs(v - o.v) > UV_EPSILON) return false;
 		if (ws.size() != o.ws.size()) return false;
@@ -326,6 +357,12 @@ struct DedupeKey {
 			if (std::fabs(ws[i].offset.x - o.ws[i].offset.x) > VERT_EPSILON) return false;
 			if (std::fabs(ws[i].offset.y - o.ws[i].offset.y) > VERT_EPSILON) return false;
 			if (std::fabs(ws[i].offset.z - o.ws[i].offset.z) > VERT_EPSILON) return false;
+		}
+		if (v12) {
+			for (int i = 0; i < 3; ++i)
+				if (std::fabs(normal[i] - o.normal[i]) > NORMAL_EPSILON) return false;
+			for (int i = 0; i < 4; ++i)
+				if (std::fabs(tangent[i] - o.tangent[i]) > NORMAL_EPSILON) return false;
 		}
 		return true;
 	}
@@ -337,7 +374,8 @@ static bool BuildExportMesh(ufbx_mesh *mesh,
                             ufbx_node *meshNode,
                             const std::vector<ExportJoint> &joints,
                             ExportMesh &out,
-                            const std::string &shaderOverride)
+                            const std::string &shaderOverride,
+                            bool v12)
 {
 	// Find the first skin deformer on this mesh (if any).
 	ufbx_skin_deformer *skin = nullptr;
@@ -349,13 +387,15 @@ static bool BuildExportMesh(ufbx_mesh *mesh,
 	struct ClusterBinding {
 		int         jointIdx;
 		ufbx_matrix geometry_to_bone;
+		ufbx_matrix bind_to_world;   // needed for v12 normal/tangent transform
 	};
 	std::vector<ClusterBinding> clusterBindings;
 	if (skin) {
-		clusterBindings.resize(skin->clusters.count, { -1, {} });
+		clusterBindings.resize(skin->clusters.count, { -1, {}, {} });
 		for (size_t c = 0; c < skin->clusters.count; ++c) {
 			ufbx_skin_cluster *cl = skin->clusters.data[c];
 			clusterBindings[c].geometry_to_bone = cl->geometry_to_bone;
+			clusterBindings[c].bind_to_world    = cl->bind_to_world;
 			if (!cl->bone_node) continue;
 			for (size_t j = 0; j < joints.size(); ++j) {
 				if (joints[j].node == cl->bone_node) {
@@ -463,19 +503,111 @@ static bool BuildExportMesh(ufbx_mesh *mesh,
 					key.ws.push_back(ew);
 				}
 
+				// v12: extract normal, tangent, bitangent sign, vertex color.
+				// Normal/tangent are transformed into true bone-local space
+				// using geometry_to_bone (same matrix used for weight offsets),
+				// matching Blender's reference exporter convention.
+				// In idTech4, idMat3 * idVec3 uses row-vector convention, so
+				// ToMat3() * storedN effectively applies R_bind, meaning stored
+				// must be R_bind^(-1) * n_world = the actual bone-local normal.
+				float storedNormal[3]  = { 0, 0, 1 };
+				float storedTangent[4] = { 1, 0, 0, 1 };
+				float storedColor[4]   = { 1, 1, 1, 1 };
+				bool  hasVertexColor   = false;
+
+				if (v12) {
+					// Find dominant joint (highest weight).
+					int   domCluster = -1;
+					float domWeight  = 0.0f;
+					if (skin && vIdx < skin->vertices.count) {
+						ufbx_skin_vertex sv = skin->vertices.data[vIdx];
+						for (uint32_t w = 0; w < sv.num_weights; ++w) {
+							ufbx_skin_weight sw = skin->weights.data[sv.weight_begin + w];
+							if (sw.weight > domWeight && sw.cluster_index < clusterBindings.size()
+							    && clusterBindings[sw.cluster_index].jointIdx >= 0) {
+								domWeight  = (float)sw.weight;
+								domCluster = (int)sw.cluster_index;
+							}
+						}
+					}
+
+					// Get geometry-space normal.
+					ufbx_vec3 gNrm = { 0, 0, 1 };
+					if (mesh->vertex_normal.exists) {
+						gNrm = ufbx_get_vertex_vec3(&mesh->vertex_normal, corner);
+					}
+
+					// Get geometry-space tangent + compute bitangent sign.
+					ufbx_vec3 gTan = { 1, 0, 0 };
+					float     bSign = 1.0f;
+					if (mesh->vertex_tangent.exists) {
+						gTan = ufbx_get_vertex_vec3(&mesh->vertex_tangent, corner);
+						if (mesh->vertex_bitangent.exists) {
+							ufbx_vec3 gBtn = ufbx_get_vertex_vec3(&mesh->vertex_bitangent, corner);
+							ufbx_vec3 cBtn = CrossVec3(gNrm, gTan);
+							bSign = (float)(DotVec3(cBtn, gBtn) < 0.0 ? -1.0 : 1.0);
+						}
+					}
+
+					// Transform into bone-local space. geometry_to_bone already
+					// equals inverse(bind_to_world) * geometry_to_world, so its
+					// rotation takes geometry-space directions to bone-local.
+					if (domCluster >= 0) {
+						const ufbx_matrix &g2b = clusterBindings[domCluster].geometry_to_bone;
+						ufbx_vec3 sN = NormalizeVec3(TransformDir(g2b, gNrm));
+						ufbx_vec3 sT = NormalizeVec3(TransformDir(g2b, gTan));
+						storedNormal[0]  = (float)sN.x;
+						storedNormal[1]  = (float)sN.y;
+						storedNormal[2]  = (float)sN.z;
+						storedTangent[0] = (float)sT.x;
+						storedTangent[1] = (float)sT.y;
+						storedTangent[2] = (float)sT.z;
+					} else {
+						// Fallback (static mesh / joint 0): apply the same
+						// transform used for fallback weight offsets.
+						ufbx_vec3 sN = NormalizeVec3(TransformDir(fallbackGeomToBone, gNrm));
+						ufbx_vec3 sT = NormalizeVec3(TransformDir(fallbackGeomToBone, gTan));
+						storedNormal[0]  = (float)sN.x;
+						storedNormal[1]  = (float)sN.y;
+						storedNormal[2]  = (float)sN.z;
+						storedTangent[0] = (float)sT.x;
+						storedTangent[1] = (float)sT.y;
+						storedTangent[2] = (float)sT.z;
+					}
+					storedTangent[3] = bSign;
+
+					// Vertex color.
+					if (mesh->vertex_color.exists) {
+						ufbx_vec4 c = ufbx_get_vertex_vec4(&mesh->vertex_color, corner);
+						storedColor[0] = (float)c.x;
+						storedColor[1] = (float)c.y;
+						storedColor[2] = (float)c.z;
+						storedColor[3] = (float)c.w;
+						hasVertexColor = true;
+					}
+
+					// Pack into DedupeKey for normal-aware dedup.
+					for (int i = 0; i < 3; ++i) key.normal[i]  = storedNormal[i];
+					for (int i = 0; i < 4; ++i) key.tangent[i] = storedTangent[i];
+				}
+
 				// Deduplicate.
 				int foundIdx = -1;
 				for (size_t u = 0; u < uniqueVerts.size(); ++u) {
-					if (uniqueVerts[u].Equals(key)) { foundIdx = (int)u; break; }
+					if (uniqueVerts[u].Equals(key, v12)) { foundIdx = (int)u; break; }
 				}
 				if (foundIdx < 0) {
 					foundIdx = (int)uniqueVerts.size();
 
-					ExportVertex ev;
+					ExportVertex ev = {};
 					ev.uv[0]       = key.u;
 					ev.uv[1]       = key.v;
 					ev.startWeight = (int)out.weights.size();
 					ev.numWeights  = (int)key.ws.size();
+					for (int i = 0; i < 3; ++i) ev.normal[i]  = storedNormal[i];
+					for (int i = 0; i < 4; ++i) ev.tangent[i] = storedTangent[i];
+					for (int i = 0; i < 4; ++i) ev.color[i]   = storedColor[i];
+					ev.hasColor    = hasVertexColor;
 					for (auto &w : key.ws) out.weights.push_back(w);
 					out.verts.push_back(ev);
 					uniqueVerts.push_back(std::move(key));
@@ -499,7 +631,8 @@ static bool WriteMD5Mesh(const char *path,
                          const std::vector<ExportMesh>  &meshes,
                          float scale,
                          float meshScale,
-                         const std::string &commandLine)
+                         const std::string &commandLine,
+                         bool v12)
 {
 	FILE *f = fopen(path, "wb");
 	if (!f) { fprintf(stderr, "Cannot open '%s' for writing.\n", path); return false; }
@@ -510,7 +643,8 @@ static bool WriteMD5Mesh(const char *path,
 	// Weight offsets are in bone-local space where the ancestor-chain scaling
 	// already cancels out, so they use only the user-supplied scale.
 
-	fprintf(f, "%s %d\n", MD5_VERSION_STRING, MD5_VERSION);
+	int version = v12 ? MD5_VERSION_V12 : MD5_VERSION;
+	fprintf(f, "%s %d\n", MD5_VERSION_STRING, version);
 	fprintf(f, "commandline \"%s\"\n\n", commandLine.c_str());
 	fprintf(f, "numJoints %zu\n", joints.size());
 	fprintf(f, "numMeshes %zu\n\n", meshes.size());
@@ -535,8 +669,15 @@ static bool WriteMD5Mesh(const char *path,
 		fprintf(f, "\n\tnumverts %zu\n", m.verts.size());
 		for (size_t i = 0; i < m.verts.size(); ++i) {
 			const ExportVertex &v = m.verts[i];
-			fprintf(f, "\tvert %zu ( %f %f ) %d %d\n",
-			        i, v.uv[0], v.uv[1], v.startWeight, v.numWeights);
+			if (v12) {
+				fprintf(f, "\tvert %zu ( %f %f ) %d %d ( %f %f %f ) ( %f %f %f %f )\n",
+				        i, v.uv[0], v.uv[1], v.startWeight, v.numWeights,
+				        v.normal[0], v.normal[1], v.normal[2],
+				        v.tangent[0], v.tangent[1], v.tangent[2], v.tangent[3]);
+			} else {
+				fprintf(f, "\tvert %zu ( %f %f ) %d %d\n",
+				        i, v.uv[0], v.uv[1], v.startWeight, v.numWeights);
+			}
 		}
 
 		fprintf(f, "\n\tnumtris %zu\n", m.tris.size());
@@ -552,6 +693,21 @@ static bool WriteMD5Mesh(const char *path,
 			        i, w.jointIdx, w.weight,
 			        w.offset.x * scale, w.offset.y * scale, w.offset.z * scale);
 		}
+
+		// v12: optional vertex colors section (after weights, before closing brace).
+		if (v12) {
+			bool anyColor = false;
+			for (const auto &v : m.verts) { if (v.hasColor) { anyColor = true; break; } }
+			if (anyColor) {
+				fprintf(f, "\n\tnumvertexcolors %zu\n", m.verts.size());
+				for (size_t i = 0; i < m.verts.size(); ++i) {
+					const ExportVertex &v = m.verts[i];
+					fprintf(f, "\tvertexcolor %zu ( %f %f %f %f )\n",
+					        i, v.color[0], v.color[1], v.color[2], v.color[3]);
+				}
+			}
+		}
+
 		fprintf(f, "}\n");
 	}
 
@@ -594,7 +750,7 @@ static bool WriteMD5Anim(const char *path,
 	// Two scales are needed here:
 	//   meshScale -- applies to world-space quantities (frame bounds, root-
 	//                joint translations). For a cm FBX this is ~0.01 times the
-	//                user scale, so world positions come out in Doom units.
+	//                user scale, so world positions come out in idTech4 units.
 	//   scale     -- applies to parent-local joint translations. These come
 	//                out of (parent_world)^-1 * child_world with the bone
 	//                hierarchy's scale already cancelled, so only the user's
@@ -837,16 +993,19 @@ static std::string SanitizeFilenameStem(const char *src, size_t len) {
 
 static void PrintUsage() {
 	fprintf(stderr,
-		"fbx2md5 -- FBX to Doom 3 MD5 mesh/anim converter\n\n"
+		"fbx2md5 -- FBX to idTech4 MD5 mesh/anim converter\n\n"
 		"Usage:\n"
-		"  fbx2md5 input.fbx output [-scale X.X] [-fps N] [-noaxes] [-nounits]\n\n"
+		"  fbx2md5 input.fbx output [-scale X.X] [-fps N] [-noaxes] [-nounits] [-v12]\n\n"
 		"Options:\n"
 		"  -scale X.X   Extra multiplier applied to all positions (default 1.0).\n"
 		"  -fps N       Override sample rate (default: FBX scene fps).\n"
 		"  -noaxes      Skip idTech4 axis conversion (keep FBX axes as-is).\n"
 		"  -nounits     Skip FBX unit conversion (keep FBX units as-is).\n"
 		"               Without this flag, scene is normalized so 1 FBX\n"
-		"               world unit = 1 output unit (cm FBXs end up /100).\n\n"
+		"               world unit = 1 output unit (cm FBXs end up /100).\n"
+		"  -v12         Output MD5 Version 12 mesh (per-vertex normals,\n"
+		"               MikkTSpace tangents, optional vertex colors).\n"
+		"               Anim output remains Version 10.\n\n"
 		"Outputs:\n"
 		"  output.md5mesh\n"
 		"  output_<stackname>.md5anim (one per FBX animation stack)\n");
@@ -862,6 +1021,7 @@ int main(int argc, char **argv) {
 	double fpsOverride = 0.0;
 	bool   convertAxes = true;
 	bool   convertUnits = true;
+	bool   v12 = false;
 
 	for (int i = 3; i < argc; ++i) {
 		if (!strcmp(argv[i], "-scale") && i + 1 < argc) {
@@ -872,6 +1032,8 @@ int main(int argc, char **argv) {
 			convertAxes = false;
 		} else if (!strcmp(argv[i], "-nounits")) {
 			convertUnits = false;
+		} else if (!strcmp(argv[i], "-v12")) {
+			v12 = true;
 		} else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
 			PrintUsage();
 			return 0;
@@ -892,7 +1054,7 @@ int main(int argc, char **argv) {
 	// --- Load FBX -------------------------------------------------------------
 	ufbx_load_opts opts = {};
 	opts.evaluate_skinning         = false;
-	opts.generate_missing_normals  = false;  // MD5 doesn't need normals
+	opts.generate_missing_normals  = v12;   // v12 needs normals; v10 doesn't
 	opts.geometry_transform_handling = UFBX_GEOMETRY_TRANSFORM_HANDLING_MODIFY_GEOMETRY;
 	opts.space_conversion          = UFBX_SPACE_CONVERSION_MODIFY_GEOMETRY;
 	if (convertAxes) {
@@ -934,6 +1096,9 @@ int main(int argc, char **argv) {
 	}
 	printf("  scaling mesh positions by %.6f (unit %s, user -scale %g)\n",
 	       (double)meshScale, convertUnits ? "on" : "off", (double)scale);
+	if (v12) {
+		printf("  output mode: MD5 Version 12 (per-vertex normals + tangents)\n");
+	}
 
 	// --- Joints ---------------------------------------------------------------
 	std::vector<ExportJoint> joints = CollectJoints(scene);
@@ -948,7 +1113,7 @@ int main(int argc, char **argv) {
 		for (size_t ni = 0; ni < mesh->instances.count; ++ni) {
 			ufbx_node *meshNode = mesh->instances.data[ni];
 			ExportMesh em;
-			if (BuildExportMesh(mesh, meshNode, joints, em, "")) {
+			if (BuildExportMesh(mesh, meshNode, joints, em, "", v12)) {
 				printf("  mesh '%s': %zu verts, %zu tris, %zu weights, shader '%s'\n",
 				       em.name.c_str(), em.verts.size(), em.tris.size(),
 				       em.weights.size(), em.shader.c_str());
@@ -963,7 +1128,7 @@ int main(int argc, char **argv) {
 
 	// --- Write mesh -----------------------------------------------------------
 	std::string meshPath = std::string(outputStem) + ".md5mesh";
-	if (!WriteMD5Mesh(meshPath.c_str(), joints, meshes, scale, meshScale, cmdLine)) {
+	if (!WriteMD5Mesh(meshPath.c_str(), joints, meshes, scale, meshScale, cmdLine, v12)) {
 		ufbx_free_scene(scene);
 		return 1;
 	}
