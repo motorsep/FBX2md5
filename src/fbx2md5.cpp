@@ -63,6 +63,15 @@
 
 #include "ufbx.h"
 
+// MikkTSpace (canonical reference impl by Morten S. Mikkelsen, zlib license).
+// Used as a fallback to compute tangents when the source FBX has none that
+// ufbx can read. Some FBX exporters (and some DCC round-trips) drop the
+// tangent layer or write it in a form ufbx doesn't surface. Since Substance
+// Painter also bakes against MikkTSpace, recomputing here yields a tangent
+// basis that matches the bake -- eliminating UV-shell shading seams that a
+// constant (1,0,0) fallback would otherwise cause.
+#include "mikktspace.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -370,6 +379,107 @@ struct DedupeKey {
 
 // Build ExportMesh from an FBX mesh. Applies winding reversal and V-flip.
 // Returns true on success (mesh had at least one triangle).
+// ---------------------------------------------------------------------------
+// MikkTSpace fallback for FBX files with no readable tangents.
+//
+// We present the mesh to MikkTSpace using the SAME fan-triangulation and
+// reversed winding that BuildExportMesh's main loop uses, so the per-corner
+// tangents computed here line up 1:1 with the corners processed there. The
+// output is indexed by a flat triangle-corner counter (tri*3 + ci), which the
+// main loop reconstructs identically.
+//
+// Everything is in geometry space (raw ufbx positions/normals/UVs). The main
+// loop then applies geometry_to_bone + Gram-Schmidt to these exactly as it
+// does for source-provided tangents, so no special-casing downstream.
+
+struct MikkFbxCtx {
+    ufbx_mesh *mesh;
+    // Flattened triangle list: each triangle stores its 3 source corner indices
+    // (indices into mesh->vertex_indices / the vertex_* attribute streams),
+    // in the reversed-winding order the main loop emits.
+    std::vector<uint32_t> triCorners;   // size = numTris*3
+    std::vector<ufbx_vec4> outTangent;  // size = numTris*3, xyz + sign
+};
+
+static int mkf_getNumFaces(const SMikkTSpaceContext *c) {
+    MikkFbxCtx *ctx = (MikkFbxCtx*)c->m_pUserData;
+    return (int)(ctx->triCorners.size() / 3);
+}
+static int mkf_getNumVerticesOfFace(const SMikkTSpaceContext *, const int) { return 3; }
+
+static void mkf_getPosition(const SMikkTSpaceContext *c, float out[], const int f, const int v) {
+    MikkFbxCtx *ctx = (MikkFbxCtx*)c->m_pUserData;
+    uint32_t corner = ctx->triCorners[(size_t)f*3 + v];
+    uint32_t vIdx = ctx->mesh->vertex_indices.data[corner];
+    ufbx_vec3 p = ctx->mesh->vertices.data[vIdx];
+    out[0]=(float)p.x; out[1]=(float)p.y; out[2]=(float)p.z;
+}
+static void mkf_getNormal(const SMikkTSpaceContext *c, float out[], const int f, const int v) {
+    MikkFbxCtx *ctx = (MikkFbxCtx*)c->m_pUserData;
+    uint32_t corner = ctx->triCorners[(size_t)f*3 + v];
+    ufbx_vec3 n = { 0, 0, 1 };
+    if (ctx->mesh->vertex_normal.exists) n = ufbx_get_vertex_vec3(&ctx->mesh->vertex_normal, corner);
+    out[0]=(float)n.x; out[1]=(float)n.y; out[2]=(float)n.z;
+}
+static void mkf_getTexCoord(const SMikkTSpaceContext *c, float out[], const int f, const int v) {
+    MikkFbxCtx *ctx = (MikkFbxCtx*)c->m_pUserData;
+    uint32_t corner = ctx->triCorners[(size_t)f*3 + v];
+    ufbx_vec2 uv = { 0, 0 };
+    if (ctx->mesh->vertex_uv.exists) uv = ufbx_get_vertex_vec2(&ctx->mesh->vertex_uv, corner);
+    out[0]=(float)uv.x; out[1]=(float)uv.y;
+}
+static void mkf_setTSpaceBasic(const SMikkTSpaceContext *c, const float t[], const float sign,
+                               const int f, const int v) {
+    MikkFbxCtx *ctx = (MikkFbxCtx*)c->m_pUserData;
+    size_t idx = (size_t)f*3 + v;
+    // MikkTSpace's sign convention: bitangent = sign * cross(N, T).
+    // idTech4 MD5v12 stores Tw with the same meaning, so pass it through.
+    ctx->outTangent[idx] = ufbx_vec4{ t[0], t[1], t[2], sign };
+}
+
+// Compute per-triangle-corner tangents for a mesh lacking source tangents.
+// triCorners must be filled with the same corner ordering the main loop uses.
+// Returns false if the mesh lacks the inputs MikkTSpace needs.
+static bool ComputeMikkTangentsFBX(ufbx_mesh *mesh, MikkFbxCtx &ctx) {
+    if (!mesh->vertex_normal.exists || !mesh->vertex_uv.exists) {
+        std::fprintf(stderr,
+            "  WARN: cannot compute MikkTSpace fallback (needs normals + UVs)\n");
+        return false;
+    }
+    // Build the triangle-corner list with the SAME fan + reversed winding
+    // as BuildExportMesh: for each face, fan (0, k+1, k) for k in [1, n-2].
+    ctx.mesh = mesh;
+    ctx.triCorners.clear();
+    for (size_t fi = 0; fi < mesh->faces.count; ++fi) {
+        ufbx_face face = mesh->faces.data[fi];
+        if (face.num_indices < 3) continue;
+        for (uint32_t k = 1; k + 1 < face.num_indices; ++k) {
+            ctx.triCorners.push_back(face.index_begin + 0);
+            ctx.triCorners.push_back(face.index_begin + k + 1);
+            ctx.triCorners.push_back(face.index_begin + k);
+        }
+    }
+    ctx.outTangent.assign(ctx.triCorners.size(), ufbx_vec4{1,0,0,1});
+
+    SMikkTSpaceInterface iface = {};
+    iface.m_getNumFaces          = mkf_getNumFaces;
+    iface.m_getNumVerticesOfFace = mkf_getNumVerticesOfFace;
+    iface.m_getPosition          = mkf_getPosition;
+    iface.m_getNormal            = mkf_getNormal;
+    iface.m_getTexCoord          = mkf_getTexCoord;
+    iface.m_setTSpaceBasic       = mkf_setTSpaceBasic;
+
+    SMikkTSpaceContext mctx;
+    mctx.m_pInterface = &iface;
+    mctx.m_pUserData  = &ctx;
+
+    if (!genTangSpaceDefault(&mctx)) {
+        std::fprintf(stderr, "  WARN: MikkTSpace genTangSpaceDefault failed\n");
+        return false;
+    }
+    return true;
+}
+
 static bool BuildExportMesh(ufbx_mesh *mesh,
                             ufbx_node *meshNode,
                             const std::vector<ExportJoint> &joints,
@@ -440,6 +550,25 @@ static bool BuildExportMesh(ufbx_mesh *mesh,
 
 	std::vector<DedupeKey> uniqueVerts;
 	uniqueVerts.reserve(mesh->num_vertices);
+
+	// If v12 is requested but the FBX carries no tangents ufbx can read,
+	// precompute them with MikkTSpace (the algorithm Substance/Blender/glTF
+	// all use). Without this, we'd fall back to a constant (1,0,0) tangent on
+	// every vertex, which the engine turns into UV-shell seams. The computed
+	// tangents are indexed by a flat triangle-corner counter that advances in
+	// lockstep with the emit loop below.
+	MikkFbxCtx mikkCtx;
+	bool useMikkFallback = false;
+	if (v12 && !mesh->vertex_tangent.exists) {
+		std::fprintf(stderr,
+			"  INFO: FBX has no readable tangents -- computing MikkTSpace fallback\n");
+		if (ComputeMikkTangentsFBX(mesh, mikkCtx)) {
+			useMikkFallback = true;
+			std::fprintf(stderr, "  INFO: MikkTSpace produced %zu corner tangents\n",
+				mikkCtx.outTangent.size());
+		}
+	}
+	size_t mikkTriCounter = 0;   // advances once per emitted triangle
 
 	// Iterate faces, fan-triangulate, emit triangles with reversed winding.
 	for (size_t fi = 0; fi < mesh->faces.count; ++fi) {
@@ -547,33 +676,65 @@ static bool BuildExportMesh(ufbx_mesh *mesh,
 							ufbx_vec3 cBtn = CrossVec3(gNrm, gTan);
 							bSign = (float)(DotVec3(cBtn, gBtn) < 0.0 ? -1.0 : 1.0);
 						}
+					} else if (useMikkFallback) {
+						// Pull the precomputed MikkTSpace tangent for this exact
+						// triangle-corner. The flat index matches because the
+						// fallback builder used the same fan + winding.
+						size_t flatIdx = mikkTriCounter * 3 + (size_t)ci;
+						if (flatIdx < mikkCtx.outTangent.size()) {
+							ufbx_vec4 mt = mikkCtx.outTangent[flatIdx];
+							gTan  = ufbx_vec3{ mt.x, mt.y, mt.z };
+							bSign = (float)mt.w;
+						}
 					}
 
 					// Transform into bone-local space. geometry_to_bone already
 					// equals inverse(bind_to_world) * geometry_to_world, so its
 					// rotation takes geometry-space directions to bone-local.
+					//
+					// After both N and T are in bone-local space, apply a
+					// Gram-Schmidt step to T against N. This guarantees the
+					// written tangent is perpendicular to the written normal
+					// even if (a) the dominant-bone matrix carries scale, or
+					// (b) the source FBX tangents were slightly off-perpendi-
+					// cular to begin with (some DCC exports cut corners). The
+					// engine's bitangent reconstruction `B = cross(N,T)*tw`
+					// only produces a clean orthonormal frame -- and thus only
+					// shades normal maps cleanly across UV-shell seams -- when
+					// T is exactly perpendicular to N. See MD5v12 spec 2.1.
+					ufbx_vec3 sN, sT;
 					if (domCluster >= 0) {
 						const ufbx_matrix &g2b = clusterBindings[domCluster].geometry_to_bone;
-						ufbx_vec3 sN = NormalizeVec3(TransformDir(g2b, gNrm));
-						ufbx_vec3 sT = NormalizeVec3(TransformDir(g2b, gTan));
-						storedNormal[0]  = (float)sN.x;
-						storedNormal[1]  = (float)sN.y;
-						storedNormal[2]  = (float)sN.z;
-						storedTangent[0] = (float)sT.x;
-						storedTangent[1] = (float)sT.y;
-						storedTangent[2] = (float)sT.z;
+						sN = NormalizeVec3(TransformDir(g2b, gNrm));
+						sT = NormalizeVec3(TransformDir(g2b, gTan));
 					} else {
-						// Fallback (static mesh / joint 0): apply the same
-						// transform used for fallback weight offsets.
-						ufbx_vec3 sN = NormalizeVec3(TransformDir(fallbackGeomToBone, gNrm));
-						ufbx_vec3 sT = NormalizeVec3(TransformDir(fallbackGeomToBone, gTan));
-						storedNormal[0]  = (float)sN.x;
-						storedNormal[1]  = (float)sN.y;
-						storedNormal[2]  = (float)sN.z;
-						storedTangent[0] = (float)sT.x;
-						storedTangent[1] = (float)sT.y;
-						storedTangent[2] = (float)sT.z;
+						// Fallback (static mesh / joint 0).
+						sN = NormalizeVec3(TransformDir(fallbackGeomToBone, gNrm));
+						sT = NormalizeVec3(TransformDir(fallbackGeomToBone, gTan));
 					}
+
+					// Gram-Schmidt: project T off N, renormalize.
+					double NdotT = sN.x*sT.x + sN.y*sT.y + sN.z*sT.z;
+					sT.x = (ufbx_real)(sT.x - sN.x * NdotT);
+					sT.y = (ufbx_real)(sT.y - sN.y * NdotT);
+					sT.z = (ufbx_real)(sT.z - sN.z * NdotT);
+					double tLen = sqrt(sT.x*sT.x + sT.y*sT.y + sT.z*sT.z);
+					if (tLen > 1e-9) {
+						sT.x = (ufbx_real)(sT.x / tLen);
+						sT.y = (ufbx_real)(sT.y / tLen);
+						sT.z = (ufbx_real)(sT.z / tLen);
+					} else {
+						// Degenerate: pick any perpendicular to N.
+						ufbx_vec3 axis = (fabs(sN.z) < 0.9) ? ufbx_vec3{0,0,1} : ufbx_vec3{1,0,0};
+						sT = NormalizeVec3(CrossVec3(sN, axis));
+					}
+
+					storedNormal[0]  = (float)sN.x;
+					storedNormal[1]  = (float)sN.y;
+					storedNormal[2]  = (float)sN.z;
+					storedTangent[0] = (float)sT.x;
+					storedTangent[1] = (float)sT.y;
+					storedTangent[2] = (float)sT.z;
 					storedTangent[3] = bSign;
 
 					// Vertex color.
@@ -616,6 +777,7 @@ static bool BuildExportMesh(ufbx_mesh *mesh,
 			}
 
 			out.tris.push_back(tri);
+			++mikkTriCounter;   // keep MikkTSpace flat-corner index in lockstep
 		}
 	}
 
