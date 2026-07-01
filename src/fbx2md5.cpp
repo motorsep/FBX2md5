@@ -851,9 +851,15 @@ static bool WriteMD5Mesh(const char *path,
 		fprintf(f, "\n\tnumweights %zu\n", m.weights.size());
 		for (size_t i = 0; i < m.weights.size(); ++i) {
 			const ExportWeight &w = m.weights[i];
+			// Weight offsets are in bone-local geometry space and must be in the
+			// SAME output units as the joint bind positions (which use meshScale).
+			// Using plain `scale` here left offsets in raw cm while joints were in
+			// inches -- a 1/unit_meters mismatch that made the whole mesh ~25.4x
+			// oversized (and, downstream, the anim bounds wrong). meshScale folds
+			// in both the unit conversion and the user -scale.
 			fprintf(f, "\tweight %zu %d %f ( %f %f %f )\n",
 			        i, w.jointIdx, w.weight,
-			        w.offset.x * scale, w.offset.y * scale, w.offset.z * scale);
+			        w.offset.x * meshScale, w.offset.y * meshScale, w.offset.z * meshScale);
 		}
 
 		// v12: optional vertex colors section (after weights, before closing brace).
@@ -909,14 +915,14 @@ static bool WriteMD5Anim(const char *path,
                          float meshScale,
                          const std::string &commandLine)
 {
-	// Two scales are needed here:
-	//   meshScale -- applies to world-space quantities (frame bounds, root-
-	//                joint translations). For a cm FBX this is ~0.01 times the
-	//                user scale, so world positions come out in idTech4 units.
-	//   scale     -- applies to parent-local joint translations. These come
-	//                out of (parent_world)^-1 * child_world with the bone
-	//                hierarchy's scale already cancelled, so only the user's
-	//                -scale multiplier remains to be applied.
+	// Scale handling:
+	//   meshScale (= user -scale * scene unit_meters) converts EVERY position
+	//   from raw FBX file units into output units. Because we never call ufbx
+	//   with target_unit_meters, world AND parent-local translations are both
+	//   in raw file units, so both use meshScale. (Genuine per-bone hierarchy
+	//   scale is already baked into the parent-local translation by ufbx and is
+	//   orthogonal to this uniform unit conversion.)
+	//
 
 	// --- Determine frame count ------------------------------------------------
 	double t0 = stack->time_begin;
@@ -1007,7 +1013,7 @@ static bool WriteMD5Anim(const char *path,
 			}
 		}
 		if (!bb.valid) {
-			// No mesh -- use joint positions (in world space, so meshScale).
+			// No mesh -- use joint positions (world space, meshScale).
 			for (size_t j = 0; j < joints.size(); ++j) {
 				ufbx_vec3 p = jointWorld[j].cols[3];
 				p.x *= meshScale; p.y *= meshScale; p.z *= meshScale;
@@ -1094,12 +1100,17 @@ static bool WriteMD5Anim(const char *path,
 	}
 	fprintf(f, "}\n");
 
-	// baseframe -- root joint is in world space (meshScale); non-root joints
-	// are parent-local (self-cancelled through parentInv, so just scale).
+	// baseframe -- all joint translations are in raw FBX file units and are
+	// converted to output units with meshScale (= user scale * unit_meters).
 	fprintf(f, "\nbaseframe {\n");
 	for (size_t j = 0; j < joints.size(); ++j) {
 		const JointFrame &bf = baseFrame[j];
-		float ts = (joints[j].parentIdx < 0) ? meshScale : scale;
+		// Every translation ufbx returns is in raw FBX file units (we deliberately
+		// do NOT set target_unit_meters), so ALL of them -- root and non-root,
+		// world and parent-local -- take the same meshScale unit conversion. The
+		// old root/non-root split wrongly assumed parent-inverse cancels the FBX
+		// unit scale; it does not, which flung skinned meshes ~1/unit_meters away.
+		float ts = meshScale;
 		fprintf(f, "\t( %f %f %f ) ( %f %f %f )\n",
 		        bf.t.x * ts, bf.t.y * ts, bf.t.z * ts,
 		        bf.q.x, bf.q.y, bf.q.z);
@@ -1112,7 +1123,7 @@ static bool WriteMD5Anim(const char *path,
 		for (size_t j = 0; j < joints.size(); ++j) {
 			if (!animBits[j]) continue;
 			const JointFrame &fr = frames[fi][j];
-			float ts = (joints[j].parentIdx < 0) ? meshScale : scale;
+			float ts = meshScale;  // raw file units -> output units (see baseframe note)
 			fprintf(f, "\t");
 			if (animBits[j] & ANIM_TX) fprintf(f, " %f", fr.t.x * ts);
 			if (animBits[j] & ANIM_TY) fprintf(f, " %f", fr.t.y * ts);
