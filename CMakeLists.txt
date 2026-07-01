@@ -21,6 +21,8 @@ add_executable(fbx2md5
     src/fbx2md5.cpp
     src/ufbx.c
     src/ufbx.h
+	src/mikktspace.c
+	src/mikktspace.h
 )
 
 target_include_directories(fbx2md5 PRIVATE src)
