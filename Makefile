@@ -22,7 +22,7 @@ BUILDDIR := build
 TARGET   := $(BUILDDIR)/fbx2md5
 
 CXX_OBJS := $(BUILDDIR)/fbx2md5.o
-C_OBJS   := $(BUILDDIR)/ufbx.o
+C_OBJS   := $(BUILDDIR)/ufbx.o $(BUILDDIR)/mikktspace.o
 OBJS     := $(CXX_OBJS) $(C_OBJS)
 
 .PHONY: all debug clean
@@ -39,6 +39,9 @@ $(BUILDDIR)/fbx2md5.o: $(SRCDIR)/fbx2md5.cpp $(SRCDIR)/ufbx.h | $(BUILDDIR)
 	$(CXX) $(CXXFLAGS) -I$(SRCDIR) -c $< -o $@
 
 $(BUILDDIR)/ufbx.o: $(SRCDIR)/ufbx.c $(SRCDIR)/ufbx.h | $(BUILDDIR)
+	$(CC) $(CFLAGS) -I$(SRCDIR) -c $< -o $@
+
+$(BUILDDIR)/mikktspace.o: $(SRCDIR)/mikktspace.c $(SRCDIR)/mikktspace.h | $(BUILDDIR)
 	$(CC) $(CFLAGS) -I$(SRCDIR) -c $< -o $@
 
 $(BUILDDIR):
