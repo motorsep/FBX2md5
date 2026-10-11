@@ -162,6 +162,33 @@ static ufbx_matrix MatFromTR(ufbx_vec3 t, ufbx_quat q) {
 	return ufbx_transform_to_matrix(&tf);
 }
 
+// MD5 joints carry no scale. Rigs frequently do -- Cascadeur parents the
+// whole skeleton under a root scaled 0.01 (its cm/m conversion), Blender
+// exports can carry the unit scale on the armature object -- and that scale
+// propagates into every bone's world matrix. Everything we write must agree
+// on ONE convention, so: joint world transforms are translation + rotation
+// only (the scale is simply dropped), and anything expressed relative to a
+// joint (weight offsets, parent-local anim transforms) is computed against
+// that scale-free frame. Dropping the scale here and keeping it in the
+// offsets is exactly the mismatch that produced 100x weight offsets against
+// 1x joints.
+static ufbx_matrix StripScale(const ufbx_matrix &m) {
+	ufbx_transform t = ufbx_matrix_to_transform(&m);
+	return MatFromTR(t.translation, t.rotation);
+}
+
+// Scale-free version of a cluster's geometry_to_bone. With
+// bind_to_world = T*R*S we have geometry_to_bone = S^-1 * R^-1 * T^-1 * G,
+// and the frame MD5 actually reconstructs is T*R, so the offset matrix we
+// need is R^-1 * T^-1 * G = S * geometry_to_bone. Exact for non-uniform
+// scale as well, and the identity when the rig carries none.
+static ufbx_matrix ScaleFreeGeometryToBone(const ufbx_skin_cluster *cl) {
+	ufbx_transform bt = ufbx_matrix_to_transform(&cl->bind_to_world);
+	ufbx_transform s  = { { 0, 0, 0 }, ufbx_identity_quat, bt.scale };
+	ufbx_matrix sm = ufbx_transform_to_matrix(&s);
+	return ufbx_matrix_mul(&sm, &cl->geometry_to_bone);
+}
+
 // Transform a direction vector by the 3x3 rotation part of a matrix (no translation).
 static ufbx_vec3 TransformDir(const ufbx_matrix &m, ufbx_vec3 v) {
 	return {
@@ -504,7 +531,7 @@ static bool BuildExportMesh(ufbx_mesh *mesh,
 		clusterBindings.resize(skin->clusters.count, { -1, {}, {} });
 		for (size_t c = 0; c < skin->clusters.count; ++c) {
 			ufbx_skin_cluster *cl = skin->clusters.data[c];
-			clusterBindings[c].geometry_to_bone = cl->geometry_to_bone;
+			clusterBindings[c].geometry_to_bone = ScaleFreeGeometryToBone(cl);
 			clusterBindings[c].bind_to_world    = cl->bind_to_world;
 			if (!cl->bone_node) continue;
 			for (size_t j = 0; j < joints.size(); ++j) {
@@ -973,8 +1000,12 @@ static bool WriteMD5Anim(const char *path,
 			const ExportJoint &ej = joints[j];
 			ufbx_matrix m;
 			if (ej.node) {
+				// Scale-free (see StripScale): the parent-local transform
+				// below must be formed between the same T*R frames the
+				// md5mesh joints use, or a scaled rig root leaks its scale
+				// into every child translation.
 				ufbx_node *en = ev->nodes.data[ej.node->typed_id];
-				m = en->node_to_world;
+				m = StripScale(en->node_to_world);
 			} else {
 				m = ufbx_identity_matrix;  // synthetic origin joint
 			}
