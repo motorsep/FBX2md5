@@ -162,6 +162,33 @@ static ufbx_matrix MatFromTR(ufbx_vec3 t, ufbx_quat q) {
 	return ufbx_transform_to_matrix(&tf);
 }
 
+// MD5 joints carry no scale. Rigs frequently do -- Cascadeur parents the
+// whole skeleton under a root scaled 0.01 (its cm/m conversion), Blender
+// exports can carry the unit scale on the armature object -- and that scale
+// propagates into every bone's world matrix. Everything we write must agree
+// on ONE convention, so: joint world transforms are translation + rotation
+// only (the scale is simply dropped), and anything expressed relative to a
+// joint (weight offsets, parent-local anim transforms) is computed against
+// that scale-free frame. Dropping the scale here and keeping it in the
+// offsets is exactly the mismatch that produced 100x weight offsets against
+// 1x joints.
+static ufbx_matrix StripScale(const ufbx_matrix &m) {
+	ufbx_transform t = ufbx_matrix_to_transform(&m);
+	return MatFromTR(t.translation, t.rotation);
+}
+
+// Scale-free version of a cluster's geometry_to_bone. With
+// bind_to_world = T*R*S we have geometry_to_bone = S^-1 * R^-1 * T^-1 * G,
+// and the frame MD5 actually reconstructs is T*R, so the offset matrix we
+// need is R^-1 * T^-1 * G = S * geometry_to_bone. Exact for non-uniform
+// scale as well, and the identity when the rig carries none.
+static ufbx_matrix ScaleFreeGeometryToBone(const ufbx_skin_cluster *cl) {
+	ufbx_transform bt = ufbx_matrix_to_transform(&cl->bind_to_world);
+	ufbx_transform s  = { { 0, 0, 0 }, ufbx_identity_quat, bt.scale };
+	ufbx_matrix sm = ufbx_transform_to_matrix(&s);
+	return ufbx_matrix_mul(&sm, &cl->geometry_to_bone);
+}
+
 // Transform a direction vector by the 3x3 rotation part of a matrix (no translation).
 static ufbx_vec3 TransformDir(const ufbx_matrix &m, ufbx_vec3 v) {
 	return {
@@ -504,7 +531,7 @@ static bool BuildExportMesh(ufbx_mesh *mesh,
 		clusterBindings.resize(skin->clusters.count, { -1, {}, {} });
 		for (size_t c = 0; c < skin->clusters.count; ++c) {
 			ufbx_skin_cluster *cl = skin->clusters.data[c];
-			clusterBindings[c].geometry_to_bone = cl->geometry_to_bone;
+			clusterBindings[c].geometry_to_bone = ScaleFreeGeometryToBone(cl);
 			clusterBindings[c].bind_to_world    = cl->bind_to_world;
 			if (!cl->bone_node) continue;
 			for (size_t j = 0; j < joints.size(); ++j) {
@@ -913,7 +940,9 @@ static bool WriteMD5Anim(const char *path,
                          double fps,
                          float scale,
                          float meshScale,
-                         const std::string &commandLine)
+                         const std::string &commandLine,
+                         const std::string &rootMotionJoint,
+                         bool rootMotionXYZ)
 {
 	// Scale handling:
 	//   meshScale (= user -scale * scene unit_meters) converts EVERY position
@@ -942,6 +971,10 @@ static bool WriteMD5Anim(const char *path,
 
 	int numFrames = (int)floor((t1 - t0) * fps + 0.5) + 1;
 	if (numFrames < 1) numFrames = 1;
+	printf("  stack range %.4f .. %.4f s (scene anim %.4f .. %.4f s)\n",
+	       stack->time_begin, stack->time_end,
+	       scene->anim ? scene->anim->time_begin : 0.0,
+	       scene->anim ? scene->anim->time_end : 0.0);
 
 	// --- Sample every frame ---------------------------------------------------
 	// frames[f][j] holds parent-local transform of joint j at frame f.
@@ -973,8 +1006,12 @@ static bool WriteMD5Anim(const char *path,
 			const ExportJoint &ej = joints[j];
 			ufbx_matrix m;
 			if (ej.node) {
+				// Scale-free (see StripScale): the parent-local transform
+				// below must be formed between the same T*R frames the
+				// md5mesh joints use, or a scaled rig root leaks its scale
+				// into every child translation.
 				ufbx_node *en = ev->nodes.data[ej.node->typed_id];
-				m = en->node_to_world;
+				m = StripScale(en->node_to_world);
 			} else {
 				m = ufbx_identity_matrix;  // synthetic origin joint
 			}
@@ -1034,6 +1071,62 @@ static bool WriteMD5Anim(const char *path,
 		ufbx_free_scene(ev);
 	}
 
+	// --- Root motion transfer -------------------------------------------------
+	// idTech4 reads locomotion from joint 0 ("origin") only: on load it strips
+	// origin's translation from every frame and keeps the last-frame value as
+	// the anim's total move delta (idMD5Anim::LoadAnim). Any other joint's
+	// translation is played back literally, so a pelvis that travels makes the
+	// mesh run away from its entity. Some tools (Cascadeur) always animate the
+	// hips and leave the root parked. This moves the travel of <joint>
+	// (its displacement from frame 0, XY by default, Z bob stays) onto origin.
+	// Both joints end up in the same world pose, so the visible result is
+	// unchanged -- only which joint carries it, and bounds need no update.
+	if (!rootMotionJoint.empty()) {
+		int k = -1;
+		for (size_t j = 0; j < joints.size(); ++j)
+			if (joints[j].name == rootMotionJoint) { k = (int)j; break; }
+		if (k < 0) {
+			fprintf(stderr, "  WARN: rootmotion joint '%s' not found -- no transfer\n", rootMotionJoint.c_str());
+		} else if (joints[k].parentIdx != 0) {
+			fprintf(stderr, "  WARN: rootmotion joint '%s' is not a direct child of '%s' -- no transfer\n",
+			        rootMotionJoint.c_str(), joints[0].name.c_str());
+		} else {
+			ufbx_vec3 base = frames[0][k].t;
+			for (int f = 0; f < numFrames; ++f) {
+				ufbx_vec3 d = { frames[f][k].t.x - base.x, frames[f][k].t.y - base.y,
+				                rootMotionXYZ ? frames[f][k].t.z - base.z : 0 };
+				// d is in origin's local frame; origin's own translation is in
+				// world space (it has no parent), so rotate by origin's rotation.
+				ufbx_vec3 dw = ufbx_quat_rotate_vec3(DecompressQuat(frames[f][0].q), d);
+				frames[f][0].t.x += dw.x; frames[f][0].t.y += dw.y; frames[f][0].t.z += dw.z;
+				frames[f][k].t.x -= d.x;  frames[f][k].t.y -= d.y;  frames[f][k].t.z -= d.z;
+			}
+			ufbx_vec3 total = frames[numFrames - 1][0].t;
+			printf("  root motion: moved '%s' travel onto '%s', total delta ( %.2f %.2f %.2f )\n",
+			       rootMotionJoint.c_str(), joints[0].name.c_str(),
+			       total.x * meshScale, total.y * meshScale, total.z * meshScale);
+		}
+	}
+
+	// --- Bounds relative to root travel --------------------------------------
+	// The engine strips origin's translation on load (frame minus baseframe)
+	// and, when it lets the anim move the entity, adds that per-frame origin
+	// offset back onto the stored bounds (idAnimBlend::AddBounds). So the file
+	// must hold bounds with the root travel taken out, or the box walks away
+	// from the mesh (or is counted twice). Applies whether the root was
+	// animated by the tool or by the transfer above.
+	{
+		ufbx_vec3 base = frames[0][0].t;
+		for (int f = 0; f < numFrames; ++f) {
+			if (!bounds[f].valid) continue;
+			ufbx_vec3 d = { (frames[f][0].t.x - base.x) * meshScale,
+			                (frames[f][0].t.y - base.y) * meshScale,
+			                (frames[f][0].t.z - base.z) * meshScale };
+			bounds[f].lo.x -= d.x; bounds[f].lo.y -= d.y; bounds[f].lo.z -= d.z;
+			bounds[f].hi.x -= d.x; bounds[f].hi.y -= d.y; bounds[f].hi.z -= d.z;
+		}
+	}
+
 	// --- Compute animBits per joint (delta compress) --------------------------
 	std::vector<int> animBits(joints.size(), 0);
 	std::vector<int> firstComp(joints.size(), 0);
@@ -1059,6 +1152,14 @@ static bool WriteMD5Anim(const char *path,
 			firstComp[j] = numAnimatedComponents;
 			for (int b = 0; b < 6; ++b) if (bits & (1 << b)) ++numAnimatedComponents;
 		}
+	}
+
+	// A stack where no joint moves is a pose, not an animation. Some tools
+	// (Cascadeur) always export a stack of some minimum length, so an "init"
+	// pose would otherwise come out as dozens of identical frames.
+	if (numAnimatedComponents == 0 && numFrames > 1) {
+		printf("  no joint animates -- collapsing %d identical frames to 1\n", numFrames);
+		numFrames = 1;
 	}
 
 	// --- Write file -----------------------------------------------------------
@@ -1173,15 +1274,147 @@ static std::string SanitizeFilenameStem(const char *src, size_t len) {
 }
 
 // -----------------------------------------------------------------------------
-// main
+// Options: command line and config file
 // -----------------------------------------------------------------------------
+
+// One entry per "shader" directive: any mesh whose NODE name or MATERIAL name
+// matches `match` (case-insensitive) is written with `shader` instead.
+struct ShaderMap { std::string match; std::string shader; };
+
+// One entry per "anim" directive. An empty name means "derive from the FBX
+// stack name" (same cleanup as the command-line path).
+struct AnimSpec { std::string fbx; std::string name; };
+
+struct Options {
+	float       scale        = 1.0f;
+	double      fps          = 0.0;      // 0 = take it from the FBX
+	bool        convertAxes  = true;
+	bool        convertUnits = true;
+	bool        v12          = false;
+	bool        noAnimPrefix = false;
+	bool        noMesh       = false;    // skip the .md5mesh (anims only)
+	std::string meshFbx;                 // FBX that carries the skin + skeleton
+	std::string outputStem;
+	std::vector<ShaderMap>   shaders;
+	std::vector<std::string> skipMeshes; // mesh node names to leave out
+	std::vector<AnimSpec>    anims;      // explicit anim list; empty = stacks of meshFbx
+	std::string rootMotionJoint;         // move this joint's travel onto joint 0
+	bool        rootMotionXYZ = false;   // include Z (default: horizontal only)
+};
+
+static bool IEquals(const std::string &a, const std::string &b) {
+	if (a.size() != b.size()) return false;
+	for (size_t i = 0; i < a.size(); ++i)
+		if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return false;
+	return true;
+}
+
+static std::string DirOf(const std::string &path) {
+	size_t p = path.find_last_of("/\\");
+	return (p == std::string::npos) ? std::string() : path.substr(0, p + 1);
+}
+
+static bool IsAbsolutePath(const std::string &p) {
+	if (p.empty()) return false;
+	if (p[0] == '/' || p[0] == '\\') return true;
+	return p.size() > 1 && p[1] == ':';
+}
+
+// Paths inside a config file are relative to the config file itself, so a
+// character's folder can carry its own config and be converted from anywhere.
+static std::string ResolveAgainst(const std::string &dir, const std::string &p) {
+	return IsAbsolutePath(p) || dir.empty() ? p : dir + p;
+}
+
+// Split a config line into tokens. Double quotes group words (for paths with
+// spaces); '#' and "//" start a comment.
+static std::vector<std::string> TokenizeLine(const std::string &line) {
+	std::vector<std::string> out;
+	std::string cur;
+	bool inQuote = false, have = false;
+	for (size_t i = 0; i < line.size(); ++i) {
+		char c = line[i];
+		if (inQuote) {
+			if (c == '"') inQuote = false; else cur += c;
+			continue;
+		}
+		if (c == '#' || (c == '/' && i + 1 < line.size() && line[i + 1] == '/')) break;
+		if (c == '"') { inQuote = true; have = true; continue; }
+		if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+			if (have) { out.push_back(cur); cur.clear(); have = false; }
+			continue;
+		}
+		cur += c; have = true;
+	}
+	if (have) out.push_back(cur);
+	return out;
+}
+
+// Config file grammar (one directive per line, see README):
+//   mesh <file.fbx>            output <stem>            nomesh
+//   scale <f>   fps <n>   noaxes   nounits   v12   noanimprefix
+//   skipmesh <node name>
+//   shader <node or material name> <shader>
+//   anim <file.fbx> [<anim name>]
+static bool ParseConfig(const char *path, Options &o) {
+	FILE *f = fopen(path, "rb");
+	if (!f) { fprintf(stderr, "Cannot open config '%s'.\n", path); return false; }
+	std::string dir = DirOf(path);
+	char buf[4096];
+	int lineNo = 0;
+	bool ok = true;
+	while (fgets(buf, sizeof(buf), f)) {
+		++lineNo;
+		std::vector<std::string> t = TokenizeLine(buf);
+		if (t.empty()) continue;
+		std::string key = t[0];
+		for (auto &c : key) c = (char)tolower((unsigned char)c);
+		size_t n = t.size() - 1;
+		auto need = [&](size_t want) {
+			if (n < want) {
+				fprintf(stderr, "%s(%d): '%s' needs %zu argument(s)\n", path, lineNo, t[0].c_str(), want);
+				ok = false;
+				return false;
+			}
+			return true;
+		};
+		if      (key == "mesh")         { if (need(1)) o.meshFbx = ResolveAgainst(dir, t[1]); }
+		else if (key == "output")       { if (need(1)) o.outputStem = ResolveAgainst(dir, t[1]); }
+		else if (key == "scale")        { if (need(1)) o.scale = (float)atof(t[1].c_str()); }
+		else if (key == "fps")          { if (need(1)) o.fps = atof(t[1].c_str()); }
+		else if (key == "noaxes")       { o.convertAxes = false; }
+		else if (key == "nounits")      { o.convertUnits = false; }
+		else if (key == "v12")          { o.v12 = true; }
+		else if (key == "noanimprefix") { o.noAnimPrefix = true; }
+		else if (key == "nomesh")       { o.noMesh = true; }
+		else if (key == "skipmesh")     { if (need(1)) o.skipMeshes.push_back(t[1]); }
+		else if (key == "shader")       { if (need(2)) o.shaders.push_back({ t[1], t[2] }); }
+		else if (key == "anim")         { if (need(1)) o.anims.push_back({ ResolveAgainst(dir, t[1]), n >= 2 ? t[2] : "" }); }
+		else if (key == "rootmotion")   { if (need(1)) { o.rootMotionJoint = t[1]; o.rootMotionXYZ = (n >= 2 && IEquals(t[2], "xyz")); } }
+		else {
+			fprintf(stderr, "%s(%d): unknown directive '%s'\n", path, lineNo, t[0].c_str());
+			ok = false;
+		}
+	}
+	fclose(f);
+	if (o.meshFbx.empty() && o.anims.empty()) {
+		fprintf(stderr, "%s: needs at least a 'mesh' or an 'anim' line\n", path);
+		ok = false;
+	}
+	if (o.outputStem.empty()) {
+		fprintf(stderr, "%s: 'output' is required\n", path);
+		ok = false;
+	}
+	return ok;
+}
 
 static void PrintUsage() {
 	fprintf(stderr,
 		"fbx2md5 -- FBX to idTech4 MD5 mesh/anim converter\n\n"
 		"Usage:\n"
-		"  fbx2md5 input.fbx output [-scale X.X] [-fps N] [-noaxes] [-nounits]\n"
-		"                           [-v12] [-noAnimPrefix]\n\n"
+		"  fbx2md5 input.fbx output [options]\n"
+		"  fbx2md5 -cfg character.cfg [options]\n"
+		"  fbx2md5 -listMaterials input.fbx\n\n"
 		"Options:\n"
 		"  -scale X.X    Extra multiplier applied to all positions (default 1.0).\n"
 		"  -fps N        Override sample rate (default: FBX scene fps).\n"
@@ -1194,7 +1427,28 @@ static void PrintUsage() {
 		"                Anim output remains Version 10.\n"
 		"  -noAnimPrefix Write anims as <stack>.md5anim instead of\n"
 		"                <output>_<stack>.md5anim. The output stem's directory\n"
-		"                (if any) is preserved.\n\n"
+		"                (if any) is preserved.\n"
+		"  -shader <name>=<shader>\n"
+		"                Write meshes whose node or material name is <name>\n"
+		"                with <shader> instead. Repeatable.\n"
+		"  -skipMesh <name>\n"
+		"                Leave the mesh node <name> out of the md5mesh. The\n"
+		"                skeleton is unaffected. Repeatable.\n"
+		"  -anim <file.fbx>[=<name>]\n"
+		"                Convert the animation in <file.fbx> (which may carry\n"
+		"                no mesh) against input.fbx's skeleton, written as\n"
+		"                <name>.md5anim next to the mesh. Repeatable; when\n"
+		"                given, input.fbx's own stacks are NOT exported.\n"
+		"  -noMesh       Skip the md5mesh; only write anims.\n"
+		"  -rootMotion <joint>[,xyz]\n"
+		"                Move <joint>'s travel (displacement from frame 0,\n"
+		"                horizontal unless ',xyz') onto the root joint, which\n"
+		"                is the only joint idTech4 reads locomotion from.\n"
+		"  -cfg <file>   Read the same settings from a config file (see\n"
+		"                README). Command-line options are applied after it.\n"
+		"  -listMaterials <file.fbx>\n"
+		"                Print each mesh node and its material names as ready\n"
+		"                to paste 'shader' lines, then exit.\n\n"
 		"Note on anim stack names:\n"
 		"  FBX tools (Blender, Maya, etc.) often prefix stack names with the\n"
 		"  object namespace, e.g. \"imp|slash1\". Everything up to and including\n"
@@ -1205,76 +1459,144 @@ static void PrintUsage() {
 		"  output_<stackname>.md5anim (one per FBX animation stack)\n");
 }
 
-int main(int argc, char **argv) {
-	if (argc < 3) { PrintUsage(); return 1; }
-
-	const char *inputPath  = argv[1];
-	const char *outputStem = argv[2];
-
-	float  scale      = 1.0f;
-	double fpsOverride = 0.0;
-	bool   convertAxes = true;
-	bool   convertUnits = true;
-	bool   v12 = false;
-	bool   noAnimPrefix = false;
-
-	for (int i = 3; i < argc; ++i) {
-		if (!strcmp(argv[i], "-scale") && i + 1 < argc) {
-			scale = (float)atof(argv[++i]);
-		} else if (!strcmp(argv[i], "-fps") && i + 1 < argc) {
-			fpsOverride = atof(argv[++i]);
-		} else if (!strcmp(argv[i], "-noaxes")) {
-			convertAxes = false;
-		} else if (!strcmp(argv[i], "-nounits")) {
-			convertUnits = false;
-		} else if (!strcmp(argv[i], "-v12")) {
-			v12 = true;
-		} else if (!strcmp(argv[i], "-noAnimPrefix") || !strcmp(argv[i], "-noanimprefix")) {
-			noAnimPrefix = true;
-		} else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-			PrintUsage();
-			return 0;
-		} else {
-			fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-			PrintUsage();
-			return 1;
+// `fbx2md5 -listMaterials file.fbx`: print every mesh node with its material
+// names, in the form the config's "shader" directive wants, so the names can
+// be pasted straight into a .cfg (or checked to be already right).
+static int ListMaterials(const char *path) {
+	ufbx_load_opts opts = {};
+	opts.ignore_geometry  = false;
+	opts.ignore_animation = true;
+	ufbx_error err;
+	ufbx_scene *scene = ufbx_load_file(path, &opts, &err);
+	if (!scene) {
+		char buf[512];
+		ufbx_format_error(buf, sizeof(buf), &err);
+		fprintf(stderr, "Failed to load '%s':\n%s\n", path, buf);
+		return 1;
+	}
+	printf("%s: %zu mesh node(s)\n\n", path, scene->meshes.count);
+	for (size_t mi = 0; mi < scene->meshes.count; ++mi) {
+		ufbx_mesh *mesh = scene->meshes.data[mi];
+		for (size_t ni = 0; ni < mesh->instances.count; ++ni) {
+			ufbx_node *n = mesh->instances.data[ni];
+			printf("mesh \"%.*s\"  (%zu verts, %zu faces, %zu material slot(s))\n",
+			       (int)n->name.length, n->name.data,
+			       mesh->num_vertices, mesh->faces.count, mesh->materials.count);
+			if (mesh->materials.count == 0) {
+				printf("    no material -- md5mesh shader will be the node name:\n");
+				printf("    shader \"%.*s\" \"<md5 material>\"\n", (int)n->name.length, n->name.data);
+			}
+			for (size_t m = 0; m < mesh->materials.count; ++m) {
+				ufbx_material *mat = mesh->materials.data[m];
+				if (!mat) continue;
+				std::string san = SanitizeShaderName(mat->name.data, mat->name.length);
+				printf("    shader \"%.*s\" \"<md5 material>\"%s\n",
+				       (int)mat->name.length, mat->name.data,
+				       m ? "   # slot >0: NOT used, only the first material is written" : "");
+				if (san != std::string(mat->name.data, mat->name.length))
+					printf("        (written as \"%s\" when not remapped)\n", san.c_str());
+			}
 		}
 	}
+	ufbx_free_scene(scene);
+	return 0;
+}
 
-	// Reconstruct a command line string for the MD5 "commandline" field.
-	std::string cmdLine;
-	for (int i = 0; i < argc; ++i) {
-		if (i) cmdLine += ' ';
-		cmdLine += argv[i];
+static bool ParseCommandLine(int argc, char **argv, Options &o) {
+	int i = 1;
+	bool haveCfg = false;
+	if (i < argc && !strcmp(argv[i], "-cfg")) {
+		if (i + 1 >= argc) { PrintUsage(); return false; }
+		if (!ParseConfig(argv[i + 1], o)) return false;
+		haveCfg = true;
+		i += 2;
+	} else {
+		if (argc < 3) { PrintUsage(); return false; }
+		o.meshFbx    = argv[1];
+		o.outputStem = argv[2];
+		i = 3;
 	}
 
-	// --- Load FBX -------------------------------------------------------------
+	for (; i < argc; ++i) {
+		const char *a = argv[i];
+		if (!strcmp(a, "-scale") && i + 1 < argc) {
+			o.scale = (float)atof(argv[++i]);
+		} else if (!strcmp(a, "-fps") && i + 1 < argc) {
+			o.fps = atof(argv[++i]);
+		} else if (!strcmp(a, "-noaxes")) {
+			o.convertAxes = false;
+		} else if (!strcmp(a, "-nounits")) {
+			o.convertUnits = false;
+		} else if (!strcmp(a, "-v12")) {
+			o.v12 = true;
+		} else if (!strcmp(a, "-noAnimPrefix") || !strcmp(a, "-noanimprefix")) {
+			o.noAnimPrefix = true;
+		} else if (!strcmp(a, "-noMesh") || !strcmp(a, "-nomesh")) {
+			o.noMesh = true;
+		} else if ((!strcmp(a, "-rootMotion") || !strcmp(a, "-rootmotion")) && i + 1 < argc) {
+			std::string s = argv[++i];
+			size_t c = s.find(',');
+			o.rootMotionJoint = s.substr(0, c);
+			o.rootMotionXYZ = (c != std::string::npos && IEquals(s.substr(c + 1), "xyz"));
+		} else if (!strcmp(a, "-shader") && i + 1 < argc) {
+			std::string s = argv[++i];
+			size_t eq = s.find('=');
+			if (eq == std::string::npos || eq == 0 || eq + 1 >= s.size()) {
+				fprintf(stderr, "-shader expects <name>=<shader>, got '%s'\n", s.c_str());
+				return false;
+			}
+			o.shaders.push_back({ s.substr(0, eq), s.substr(eq + 1) });
+		} else if ((!strcmp(a, "-skipMesh") || !strcmp(a, "-skipmesh")) && i + 1 < argc) {
+			o.skipMeshes.push_back(argv[++i]);
+		} else if (!strcmp(a, "-anim") && i + 1 < argc) {
+			std::string s = argv[++i];
+			size_t eq = s.find('=');
+			if (eq == std::string::npos) o.anims.push_back({ s, "" });
+			else o.anims.push_back({ s.substr(0, eq), s.substr(eq + 1) });
+		} else if (!strcmp(a, "-cfg")) {
+			fprintf(stderr, "-cfg must be the first argument\n");
+			return false;
+		} else if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
+			PrintUsage();
+			return false;
+		} else {
+			fprintf(stderr, "Unknown argument: %s\n", a);
+			PrintUsage();
+			return false;
+		}
+	}
+	(void)haveCfg;
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// Scene loading
+// -----------------------------------------------------------------------------
+
+static ufbx_scene *LoadScene(const std::string &path, const Options &o, float &meshScale) {
 	ufbx_load_opts opts = {};
 	opts.evaluate_skinning         = false;
-	opts.generate_missing_normals  = v12;   // v12 needs normals; v10 doesn't
+	opts.generate_missing_normals  = o.v12;   // v12 needs normals; v10 doesn't
 	opts.geometry_transform_handling = UFBX_GEOMETRY_TRANSFORM_HANDLING_MODIFY_GEOMETRY;
 	opts.space_conversion          = UFBX_SPACE_CONVERSION_MODIFY_GEOMETRY;
-	if (convertAxes) {
+	if (o.convertAxes) {
 		opts.target_axes = ufbx_axes_right_handed_z_up;
 	}
 	// NOTE: we do NOT set target_unit_meters. Letting ufbx do unit conversion
 	// interacts badly with ufbx_evaluate_scene (evaluated local transforms end
 	// up scaled by an extra factor vs the static ones). Instead we compute a
-	// unit-scale factor ourselves and apply it to mesh positions/offsets only
-	// -- animation-time local transforms self-cancel the bone-hierarchy scale
-	// when we compute (parent_world)^-1 * child_world, so they come out in the
-	// right magnitude naturally.
+	// unit-scale factor ourselves and apply it to every position we write.
 
 	ufbx_error err;
-	ufbx_scene *scene = ufbx_load_file(inputPath, &opts, &err);
+	ufbx_scene *scene = ufbx_load_file(path.c_str(), &opts, &err);
 	if (!scene) {
 		char buf[512];
 		ufbx_format_error(buf, sizeof(buf), &err);
-		fprintf(stderr, "Failed to load '%s':\n%s\n", inputPath, buf);
-		return 1;
+		fprintf(stderr, "Failed to load '%s':\n%s\n", path.c_str(), buf);
+		return nullptr;
 	}
 
-	printf("Loaded '%s'\n", inputPath);
+	printf("Loaded '%s'\n", path.c_str());
 	printf("  %zu nodes, %zu meshes, %zu skin deformers, %zu anim stacks\n",
 	       scene->nodes.count, scene->meshes.count,
 	       scene->skin_deformers.count, scene->anim_stacks.count);
@@ -1283,100 +1605,195 @@ int main(int argc, char **argv) {
 	       scene->settings.frames_per_second);
 
 	// Fold the FBX unit scale into the user scale so it applies uniformly to
-	// mesh joint positions and weight offsets. Anim local-transform
-	// translations self-correct via the parent-inverse cancellation and
-	// should NOT be scaled again -- WriteMD5Anim skips meshScale for them.
-	float meshScale = scale;
-	if (convertUnits) {
+	// joint positions, weight offsets and anim translations.
+	meshScale = o.scale;
+	if (o.convertUnits) {
 		double u = scene->settings.unit_meters;
-		if (u > 0.0) meshScale = (float)(scale * u);
+		if (u > 0.0) meshScale = (float)(o.scale * u);
 	}
-	printf("  scaling mesh positions by %.6f (unit %s, user -scale %g)\n",
-	       (double)meshScale, convertUnits ? "on" : "off", (double)scale);
-	if (v12) {
-		printf("  output mode: MD5 Version 12 (per-vertex normals + tangents)\n");
+	printf("  scaling positions by %.6f (unit %s, user -scale %g)\n",
+	       (double)meshScale, o.convertUnits ? "on" : "off", (double)o.scale);
+	return scene;
+}
+
+// An anim FBX exported separately from the mesh must carry the same skeleton:
+// the engine matches md5anim joints to the md5mesh by name AND parent, in
+// order, and the bounds we compute skin the mesh with this file's joints.
+static bool SkeletonsMatch(const std::vector<ExportJoint> &mesh,
+                           const std::vector<ExportJoint> &anim,
+                           const std::string &animPath)
+{
+	if (mesh.size() != anim.size()) {
+		fprintf(stderr, "  ERROR: '%s' has %zu joints, mesh has %zu -- skipping\n",
+		        animPath.c_str(), anim.size(), mesh.size());
+		return false;
+	}
+	for (size_t j = 0; j < mesh.size(); ++j) {
+		if (mesh[j].name != anim[j].name || mesh[j].parentIdx != anim[j].parentIdx) {
+			fprintf(stderr, "  ERROR: '%s' joint %zu is '%s' (parent %d), mesh has '%s' (parent %d) -- skipping\n",
+			        animPath.c_str(), j, anim[j].name.c_str(), anim[j].parentIdx,
+			        mesh[j].name.c_str(), mesh[j].parentIdx);
+			return false;
+		}
+	}
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// main
+// -----------------------------------------------------------------------------
+
+int main(int argc, char **argv) {
+	if (argc >= 3 && (!strcmp(argv[1], "-listMaterials") || !strcmp(argv[1], "-listmaterials"))) {
+		return ListMaterials(argv[2]);
 	}
 
-	// --- Joints ---------------------------------------------------------------
+	Options o;
+	if (!ParseCommandLine(argc, argv, o)) return 1;
+
+	// Reconstruct a command line string for the MD5 "commandline" field.
+	std::string cmdLine;
+	for (int i = 0; i < argc; ++i) {
+		if (i) cmdLine += ' ';
+		cmdLine += argv[i];
+	}
+
+	double fps = o.fps;
+
+	// --- Mesh scene: skeleton + skin ------------------------------------------
+	// With no 'mesh' the first anim FBX supplies the skeleton and the anims get
+	// joint-only bounds (warned below).
+	std::string skelPath = !o.meshFbx.empty() ? o.meshFbx : o.anims[0].fbx;
+	float meshScale = 1.0f;
+	ufbx_scene *scene = LoadScene(skelPath, o, meshScale);
+	if (!scene) return 1;
+
 	std::vector<ExportJoint> joints = CollectJoints(scene);
 	EnsureAtLeastOneJoint(joints);
 	printf("  %zu joints\n", joints.size());
 
-	// --- Meshes ---------------------------------------------------------------
 	std::vector<ExportMesh> meshes;
 	for (size_t mi = 0; mi < scene->meshes.count; ++mi) {
 		ufbx_mesh *mesh = scene->meshes.data[mi];
 		// A mesh may be instanced across multiple nodes; emit one ExportMesh per instance.
 		for (size_t ni = 0; ni < mesh->instances.count; ++ni) {
 			ufbx_node *meshNode = mesh->instances.data[ni];
+			std::string nodeName(meshNode->name.data, meshNode->name.length);
+			std::string matName;
+			if (mesh->materials.count > 0 && mesh->materials.data[0]) {
+				matName.assign(mesh->materials.data[0]->name.data, mesh->materials.data[0]->name.length);
+			}
+
+			bool skip = false;
+			for (const auto &s : o.skipMeshes) if (IEquals(s, nodeName)) skip = true;
+			if (skip) {
+				printf("  mesh '%s': skipped\n", nodeName.c_str());
+				continue;
+			}
+
+			std::string shaderOverride;
+			for (const auto &s : o.shaders) {
+				if (IEquals(s.match, nodeName) || (!matName.empty() && IEquals(s.match, matName))) {
+					shaderOverride = s.shader;
+					break;
+				}
+			}
+
 			ExportMesh em;
-			if (BuildExportMesh(mesh, meshNode, joints, em, "", v12)) {
-				printf("  mesh '%s': %zu verts, %zu tris, %zu weights, shader '%s'\n",
+			if (BuildExportMesh(mesh, meshNode, joints, em, shaderOverride, o.v12)) {
+				printf("  mesh '%s': %zu verts, %zu tris, %zu weights, shader '%s'%s\n",
 				       em.name.c_str(), em.verts.size(), em.tris.size(),
-				       em.weights.size(), em.shader.c_str());
+				       em.weights.size(), em.shader.c_str(),
+				       shaderOverride.empty() ? "" : " (override)");
 				meshes.push_back(std::move(em));
 			}
 		}
 	}
 
+	// Every 'shader' / 'skipmesh' line should have hit something; a typo in a
+	// mesh name would otherwise fail silently.
+	for (const auto &s : o.shaders) {
+		bool hit = false;
+		for (const auto &m : meshes) if (s.shader == m.shader) hit = true;
+		if (!hit) fprintf(stderr, "  WARN: shader override '%s' matched no mesh\n", s.match.c_str());
+	}
+
 	if (meshes.empty()) {
-		printf("  (no meshes -- skeleton/anim only output)\n");
+		printf("  (no meshes -- skeleton/anim only output; anim bounds will be joint-only)\n");
 	}
 
 	// --- Write mesh -----------------------------------------------------------
-	std::string meshPath = std::string(outputStem) + ".md5mesh";
-	if (!WriteMD5Mesh(meshPath.c_str(), joints, meshes, scale, meshScale, cmdLine, v12)) {
-		ufbx_free_scene(scene);
-		return 1;
+	if (!o.noMesh && !meshes.empty()) {
+		std::string meshPath = o.outputStem + ".md5mesh";
+		if (!WriteMD5Mesh(meshPath.c_str(), joints, meshes, o.scale, meshScale, cmdLine, o.v12)) {
+			ufbx_free_scene(scene);
+			return 1;
+		}
+		printf("Wrote %s\n", meshPath.c_str());
 	}
-	printf("Wrote %s\n", meshPath.c_str());
 
 	// --- Animations -----------------------------------------------------------
-	double fps = fpsOverride;
-	if (fps <= 0.0) {
-		fps = scene->settings.frames_per_second;
-		if (fps <= 0.0) fps = 24.0;
-	}
-	printf("  using %.3f fps\n", fps);
+	// Directory part of outputStem (everything up to the last separator) so
+	// anims land next to the mesh.
+	std::string animDir = DirOf(o.outputStem);
 
-	// Precompute the directory part of outputStem (everything up to the last
-	// '/' or '\\', inclusive) so -noAnimPrefix writes anims into the same
-	// directory as the mesh rather than the current working directory.
-	std::string animDir;
-	{
-		const char *s = outputStem;
-		const char *lastSep = nullptr;
-		for (const char *p = s; *p; ++p) {
-			if (*p == '/' || *p == '\\') lastSep = p;
-		}
-		if (lastSep) animDir.assign(s, (size_t)(lastSep - s + 1));
-	}
+	// With no explicit anim list, every stack of the mesh FBX is an anim.
+	std::vector<AnimSpec> anims = o.anims;
+	if (anims.empty()) anims.push_back({ skelPath, "" });
 
 	int animsWritten = 0;
-	for (size_t si = 0; si < scene->anim_stacks.count; ++si) {
-		ufbx_anim_stack *stack = scene->anim_stacks.data[si];
-
-		std::string stackName = SanitizeFilenameStem(stack->name.data, stack->name.length);
-		std::string animPath  = noAnimPrefix
-			? (animDir + stackName + ".md5anim")
-			: (std::string(outputStem) + "_" + stackName + ".md5anim");
-
-		printf("anim stack '%.*s' -> %s\n",
-		       (int)stack->name.length, stack->name.data, animPath.c_str());
-
-		// Anim uses user `scale` only; the FBX unit conversion is already
-		// implicit in the parent-inverse math used to form local transforms.
-		if (WriteMD5Anim(animPath.c_str(), scene, stack, joints, meshes, fps, scale, meshScale, cmdLine)) {
-			printf("Wrote %s\n", animPath.c_str());
-			++animsWritten;
+	for (const AnimSpec &spec : anims) {
+		ufbx_scene *as = scene;
+		float animScale = meshScale;
+		std::vector<ExportJoint> *aj = &joints;
+		std::vector<ExportJoint> animJoints;
+		if (spec.fbx != skelPath) {
+			as = LoadScene(spec.fbx, o, animScale);
+			if (!as) continue;
+			animJoints = CollectJoints(as);
+			EnsureAtLeastOneJoint(animJoints);
+			if (!SkeletonsMatch(joints, animJoints, spec.fbx)) { ufbx_free_scene(as); continue; }
+			aj = &animJoints;
 		}
-	}
 
-	if (scene->anim_stacks.count == 0) {
-		printf("  (no animation stacks in FBX)\n");
+		double useFps = fps;
+		if (useFps <= 0.0) {
+			useFps = as->settings.frames_per_second;
+			if (useFps <= 0.0) useFps = 24.0;
+		}
+
+		if (as->anim_stacks.count == 0) {
+			fprintf(stderr, "  WARN: '%s' has no animation stacks\n", spec.fbx.c_str());
+		}
+		for (size_t si = 0; si < as->anim_stacks.count; ++si) {
+			ufbx_anim_stack *stack = as->anim_stacks.data[si];
+			std::string stackName = SanitizeFilenameStem(stack->name.data, stack->name.length);
+
+			std::string animPath;
+			if (!spec.name.empty()) {
+				// Explicit name: one file per stack is still possible, so
+				// stacks past the first keep their own name as a suffix.
+				animPath = animDir + spec.name + (si ? "_" + stackName : "") + ".md5anim";
+			} else if (o.noAnimPrefix) {
+				animPath = animDir + stackName + ".md5anim";
+			} else {
+				animPath = o.outputStem + "_" + stackName + ".md5anim";
+			}
+
+			printf("anim stack '%.*s' -> %s (%.3f fps)\n",
+			       (int)stack->name.length, stack->name.data, animPath.c_str(), useFps);
+
+			if (WriteMD5Anim(animPath.c_str(), as, stack, *aj, meshes, useFps, o.scale, animScale, cmdLine,
+			                 o.rootMotionJoint, o.rootMotionXYZ)) {
+				printf("Wrote %s\n", animPath.c_str());
+				++animsWritten;
+			}
+		}
+
+		if (as != scene) ufbx_free_scene(as);
 	}
 
 	ufbx_free_scene(scene);
-	printf("Done. %zu mesh(es), %d anim(s).\n", meshes.size(), animsWritten);
+	printf("Done. %zu mesh(es), %d anim(s).\n", o.noMesh ? (size_t)0 : meshes.size(), animsWritten);
 	return 0;
 }

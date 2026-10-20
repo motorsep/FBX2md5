@@ -55,7 +55,9 @@ cmake --build build
 
 ```
 fbx2md5 input.fbx output [-scale X.X] [-fps N] [-noaxes] [-nounits] [-v12]
-                         [-noAnimPrefix]
+                         [-noAnimPrefix] [-shader name=shader]... [-skipMesh name]...
+                         [-anim file.fbx[=name]]... [-noMesh]
+fbx2md5 -cfg character.cfg [options]
 ```
 
 ### Positional arguments
@@ -75,6 +77,99 @@ fbx2md5 input.fbx output [-scale X.X] [-fps N] [-noaxes] [-nounits] [-v12]
 | `-nounits`       | Skip FBX unit conversion. By default the tool assumes the FBX is authored in centimeters (the Maya / Max / Blender default) and divides positions by 100 so that one output unit equals one meter. Pass this flag when the source FBX is already authored in idTech4 units. |
 | `-v12`           | Emit MD5 Version 12 mesh output. Adds per-vertex normals, MikkTSpace tangents with bitangent sign, and (when the FBX has them) vertex colors. Requires a v12-aware engine build such as [StormEngine2](https://github.com/motorsep/StormEngine2). Animation output remains Version 10 — the engine accepts v10 anims against v12 meshes. |
 | `-noAnimPrefix`  | Drop the mesh-stem prefix from animation filenames. Writes `<stack>.md5anim` (e.g. `slash1.md5anim`) instead of the default `<o>_<stack>.md5anim` (e.g. `hero_slash1.md5anim`). If the output stem includes a directory (`path/to/hero`), that directory is preserved — the anims land next to the mesh. |
+| `-shader <name>=<shader>` | Write meshes whose node name **or** material name is `<name>` (case-insensitive) with `<shader>` on their `shader` line. Repeatable. The tool warns when an override matches nothing. |
+| `-skipMesh <name>` | Leave the mesh node `<name>` out of the md5mesh. The skeleton is untouched — every bone is still written, so anims stay shared between the full and the partial mesh. Repeatable. |
+| `-anim <file.fbx>[=<name>]` | Convert the animation in `<file.fbx>` against `input.fbx`'s skeleton, written as `<name>.md5anim` next to the mesh (stack name if `<name>` is omitted). The anim FBX may carry no mesh at all; its skeleton must match `input.fbx`'s by joint name and parent, or the file is skipped with an error. Repeatable. When any `-anim` is given, `input.fbx`'s own stacks are **not** exported. |
+| `-noMesh`        | Skip the md5mesh; only write anims. |
+| `-rootMotion <joint>[,xyz]` | Move `<joint>`'s travel (its displacement from frame 0; horizontal only unless `,xyz`) onto the root joint. idTech4 reads locomotion from joint 0 only — see *Root motion* below. |
+| `-cfg <file>`    | Read everything above from a config file (must be the first argument; see below). Options after it on the command line are applied on top. |
+| `-listMaterials <file.fbx>` | Print every mesh node with its material names as paste-ready `shader` lines, then exit. Use it to see what your DCC tool actually named things before writing a config. |
+
+### Config file
+
+For a character that lives in several FBX files — one with the skinned mesh,
+one per animation — a config file keeps the whole conversion in one place
+and makes re-exports a single command:
+
+```
+fbx2md5 -cfg hero.cfg
+```
+
+A complete, commented example ships as [`examples/hero.cfg`](examples/hero.cfg).
+The short version:
+
+```
+# hero.cfg -- paths are relative to this file
+mesh      hero_bind.fbx
+output    ../models/md5/hero/hero      # hero.md5mesh, anims next to it
+nounits
+v12
+
+shader    "Body_mat"   models/characters/hero/body
+shader    "Head_mat"   models/characters/hero/head
+skipmesh  Hair                         # left out of the md5mesh; bones stay
+
+anim      hero_bind.fbx    init        # a pose: collapses to 1 frame
+anim      hero_run.fbx     run
+anim      hero_run_back.fbx run_back
+```
+
+One directive per line; `#` or `//` starts a comment; double-quote names
+and paths that contain spaces.
+
+| Directive | Meaning |
+|-----------|---------|
+| `mesh <file.fbx>` | The FBX carrying the skinned mesh and skeleton. |
+| `output <stem>` | Output stem, as the positional `output` argument. Required. |
+| `scale`, `fps`, `noaxes`, `nounits`, `v12`, `noanimprefix`, `nomesh` | Same as the flags. |
+| `shader <name> <shader>` | Same as `-shader name=shader`. `<name>` is the FBX material name, or the mesh node name if the mesh has no material. |
+| `skipmesh <node>` | Same as `-skipMesh`. |
+| `anim <file.fbx> [<name>]` | Same as `-anim`. With `<name>`, written as `<name>.md5anim` in the output directory; without, the stack name is used. |
+| `rootmotion <joint> [xyz]` | Same as `-rootMotion`. |
+
+`mesh` or at least one `anim` is required. With no `anim` lines, every
+animation stack in the `mesh` FBX is exported, as on the command line.
+
+Why the config wants the mesh even when you only convert animations: md5anim
+bounds are computed by skinning the actual mesh with each frame's joints.
+An anim-only FBX converted by itself only has joints to measure, which gives
+bounds that are too tight for the engine's culling — the tool warns when
+that happens. Every anim FBX must carry the same skeleton as the mesh FBX
+(same joint names and parents, in order); mismatches are reported and the
+file is skipped.
+
+### Skeleton scale is baked out
+
+MD5 joints have no scale, but rigs often do: Cascadeur parents the whole
+skeleton under a root scaled 0.01, Blender exports can carry the unit scale
+on the armature. The converter writes every joint as translation + rotation
+and computes weight offsets and animation transforms against those
+scale-free frames, so a scaled rig converts exactly. No flag needed; this is
+mentioned because an md5mesh whose weights are 100× the size of its joints
+is what the *absence* of this handling looks like.
+
+### Root motion
+
+The engine reads locomotion from joint 0 (`origin`) only: on load it strips
+origin's translation from every frame and keeps the total as the anim's
+move delta, which drives AI movement (and is discarded for the player, whose
+movement comes from physics). Any other joint's translation is played back
+literally — a pelvis that travels makes the mesh run away from its entity.
+
+If your tool animates the hips rather than the root, `rootmotion pelvis`
+(or `-rootMotion pelvis`) moves that joint's displacement from frame 0 onto
+`origin`; by default only the horizontal part, so the vertical bob stays on
+the pelvis (`xyz` moves all three). The joint must be a direct child of the
+root. The world pose is unchanged — only which joint carries the travel.
+Bounds in the md5anim are always written relative to the root's travel,
+which is what the engine expects whether or not this option is used.
+
+### Static stacks collapse to one frame
+
+Some tools (Cascadeur) never export a stack shorter than one second, so a
+bind/init pose comes out as dozens of identical frames. A stack in which no
+joint animates at all is written as a single frame. A real animation is
+never affected.
 
 ### Animation filenames and stack-name cleanup
 
@@ -116,6 +211,15 @@ Look at the `scene unit: X m/unit` line the tool prints at load time. If it
 says `0.010000`, the file is cm-authored and the default is correct. If it
 says `1.000000` or similar and your output looks 100× too small, add
 `-nounits`.
+
+The header can also simply be wrong. Cascadeur, for example, writes a cm
+header over data that is already in the scene's display units, so a
+character meant to be 75 units tall arrives as 75 "centimetres" and the
+default conversion shrinks it to 0.75. The `scaling positions by` line and
+the md5anim bounds tell you immediately; `-nounits` (plus `-scale` if the
+display units differ from the engine's) is the fix. What each exporter
+writes depends on its settings, so check this per tool and per project
+rather than assuming.
 
 ### About `-v12`
 
@@ -168,6 +272,25 @@ single character and you want `walk.md5anim`, `run.md5anim`, etc.):
 
 ```
 fbx2md5 hero.fbx hero -noAnimPrefix
+```
+
+See what the FBX calls its meshes and materials before writing overrides:
+
+```
+fbx2md5 -listMaterials hero.fbx
+```
+
+Convert a mesh FBX plus separately exported animation FBXs, with material
+names remapped and one mesh left out, all from one file:
+
+```
+fbx2md5 -cfg hero.cfg
+```
+
+The same without a config:
+
+```
+fbx2md5 hero_bind.fbx hero -v12 -shader Body_mat=models/characters/hero/body -skipMesh Hair -anim hero_bind.fbx=init -anim hero_run.fbx=run
 ```
 
 ## Acknowledgements
